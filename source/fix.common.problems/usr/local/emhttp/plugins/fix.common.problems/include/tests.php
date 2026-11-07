@@ -1572,34 +1572,47 @@ function templateRequiredFields() {
     $i = count($apps);
     $apps[] = $app;
     foreach (['TemplateURL','caTemplateURL'] as $k) {
-      if ( is_string($app[$k] ?? null) && $app[$k] ) { $byUrl[$urlKey($app[$k])][] = $i; }
+      if ( ! is_string($app[$k] ?? null) || ! $app[$k] ) { continue; }
+      $key = $urlKey($app[$k]);
+      if ( ! in_array($i,$byUrl[$key] ?? [],true) ) { $byUrl[$key][] = $i; }  # both addresses of one app count once
     }
     $byRepo[$repoKey($app['Repository'])][] = $i;
     $byBase[$baseKey($app['Repository'])][] = $i;
   }
 
   $dockerClient = new DockerClient();
+  $dockerTemplates = new DockerTemplates();
+  $myTemplates = $dockerTemplates->getAllInfo();
   foreach ($dockerClient->getDockerContainers() as $container) {
     $name = $container['Name'];
-    $xml = @simplexml_load_file($fixPaths['dockerTemplates']."/my-$name.xml");
-    if ( ! $xml || ! isset($xml->Config) ) { continue; }
+    # the saved template Docker Manager uses for this container (found by its Name), else the usual file name
+    $templateFile = $myTemplates[$name]['template'] ?? "";
+    if ( ! $templateFile || ! is_file($templateFile) ) { $templateFile = $dockerTemplates->getUserTemplate($name) ?: $fixPaths['dockerTemplates']."/my-$name.xml"; }
+    $xml = @simplexml_load_file($templateFile);
+    if ( ! $xml ) { continue; }
+    # a version 2 template (what Docker Manager saves) without Config lines has no fields; an old version 1 template is not compared
+    if ( ! isset($xml->Config) && (string)$xml['version'] != "2" ) { continue; }
     $repo = $repoKey((string)$xml->Repository);
     $url = trim((string)$xml->TemplateURL);
 
     # match by template address, then by image, then by the image on another registry;
     # several templates and nothing to tell them apart means no match
     $found = ($url && strtolower($url) != "false") ? ($byUrl[$urlKey($url)] ?? []) : [];
+    $support = trim((string)$xml->Support);
+    $project = trim((string)$xml->Project);
+    $sameSupport = function($candidates) use ($apps,$support,$project) {
+      return array_values(array_filter($candidates,function($i) use ($apps,$support,$project) {
+        return ($support && ($apps[$i]['Support'] ?? "") == $support) || ($project && ($apps[$i]['Project'] ?? "") == $project);
+      }));
+    };
     if ( count($found) > 1 ) {
       $found = array_values(array_filter($found,function($i) use ($apps,$repoKey,$repo) { return $repoKey($apps[$i]['Repository']) == $repo; }));
     }
-    $support = trim((string)$xml->Support);
-    $project = trim((string)$xml->Project);
+    if ( count($found) > 1 ) { $found = $sameSupport($found); }
     foreach ([$byRepo[$repo] ?? [],$byBase[$baseKey($repo)] ?? []] as $candidates) {
       if ( $found ) { break; }
       if ( count($candidates) > 1 ) {
-        $candidates = array_values(array_filter($candidates,function($i) use ($apps,$support,$project) {
-          return ($support && ($apps[$i]['Support'] ?? "") == $support) || ($project && ($apps[$i]['Project'] ?? "") == $project);
-        }));
+        $candidates = $sameSupport($candidates);
         if ( count($candidates) != 1 ) { break; }
       }
       $found = $candidates;
