@@ -2475,14 +2475,23 @@ function shutdownTimeoutFit() {
   # The stop scripts this models were checked from 6.12.0 on
   if ( version_compare($unRaidVersion,"6.12.0","<") ) { return; }
 
-  # rc.local_shutdown: TIMEOUT=${shutdownTimeout:-90}, wraps the whole array stop
+  # A set value is used as it is, 0 included; only an unset or empty value gets the default (${X:-default})
+  $setOr = function($value,$default) {
+    $value = trim((string)$value);
+    return $value === "" ? $default : (int)$value;
+  };
+  $incomplete = [];
+
+  # rc.local_shutdown: TIMEOUT=${shutdownTimeout:-90}, wraps the whole array stop; timeout 0 means no limit
   $unRaidVars = my_parse_ini_file($fixPaths['var.ini']);
-  $shutdown = (int)($unRaidVars['shutdownTimeout'] ?? 0) ?: 90;
+  $shutdown = $setOr($unRaidVars['shutdownTimeout'] ?? "",90);
+  if ( $shutdown === 0 ) { return; }
   $margin = 15;   # unmount, sync, daemons stopping
 
-  # Containers: running now, or set to autostart
+  # Containers: running now (paused included), or set to autostart
   $dockerSec = 0;
   $dockerText = "";
+  $unlimited = [];
   if ( $dockerRunning ) {
     # rc.docker stops the containers it manages (label net.unraid.docker.managed, all containers on 6.12);
     # the Docker daemon stops the others when it exits, each with its own stop time-out, within 30 s
@@ -2491,33 +2500,45 @@ function shutdownTimeoutFit() {
     $others = [];
     $all = [];
     $lines = [];
-    exec("timeout 20 docker ps -a --format '{{.Names}}|{{.State}}|{{.Label \"net.unraid.docker.managed\"}}' 2>/dev/null",$lines);
+    exec("timeout 20 docker ps -a --format '{{.Names}}|{{.State}}|{{.Labels}}' 2>/dev/null",$lines,$rc);
+    if ( $rc ) { $incomplete[] = "Docker"; }
     foreach ( $lines as $line ) {
-      $part = explode("|",$line);
+      $part = explode("|",$line,3);
       if ( count($part) < 3 ) { continue; }
       $all[$part[0]] = true;
-      if ( $part[1] != "running" ) { continue; }
-      if ( ! $newStop || $part[2] !== "" ) { $managed[$part[0]] = true; } else { $others[$part[0]] = true; }
+      # rc.docker lists containers with docker ps, which includes paused ones
+      if ( $part[1] != "running" && $part[1] != "paused" ) { continue; }
+      # rc.docker greps the labels for "net.unraid.docker.managed=", so an empty value counts as managed
+      if ( ! $newStop || strpos($part[2],"net.unraid.docker.managed=") !== false ) { $managed[$part[0]] = true; } else { $others[$part[0]] = true; }
     }
     foreach ( @file("/var/lib/docker/unraid-autostart",FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES) ?: [] as $line ) {
       $name = strtok(trim($line)," ");
       if ( $name !== false && isset($all[$name]) && ! isset($others[$name]) ) { $managed[$name] = true; }
     }
-    $ownStop = function($names) {
-      $longest = 10;   # Docker's default stop time-out
-      foreach ( $names as $name ) {
-        $own = trim(exec("timeout 10 docker inspect --format='{{.Config.StopTimeout}}' ".escapeshellarg($name)." 2>/dev/null"));
-        if ( is_numeric($own) ) { $longest = max($longest,(int)$own); }
+    # Longest own stop time-out of these containers, one docker inspect for all of them.
+    # Unset means Docker's default of 10 s; a negative value means docker stop waits without limit.
+    $ownStop = function($names) use (&$incomplete, &$unlimited) {
+      $longest = 0;
+      $out = [];
+      exec("timeout 20 docker inspect --format='{{.Name}}|{{.Config.StopTimeout}}' ".implode(" ",array_map("escapeshellarg",$names))." 2>/dev/null",$out,$rc);
+      if ( $rc == 124 || ! $out ) { $incomplete[] = "Docker"; }
+      foreach ( $out as $line ) {
+        $part = explode("|",$line,2);
+        if ( count($part) < 2 ) { continue; }
+        $own = trim($part[1]);
+        if ( ! is_numeric($own) ) { $own = 10; }
+        if ( (int)$own < 0 ) { $unlimited[] = ltrim($part[0],"/"); continue; }
+        $longest = max($longest,(int)$own);
       }
-      return $longest;
+      return $out ? $longest : 10;
     };
     $parts = [];
     $count = count($managed);
     if ( $count ) {
       if ( $newStop ) {
-        # rc.docker: docker stop --time=${DOCKER_TIMEOUT:-10}
+        # rc.docker: docker stop --time=${DOCKER_TIMEOUT:-10}, which overrides each container's own time-out
         $dockerCfg = @my_parse_ini_file("/boot/config/docker.cfg");
-        $stopTime = (int)($dockerCfg['DOCKER_TIMEOUT'] ?? 0) ?: 10;
+        $stopTime = max(0,$setOr($dockerCfg['DOCKER_TIMEOUT'] ?? "",10));
         $timeName = "Docker stop time-out";
       } else {
         # 6.12 rc.docker: plain docker stop, so each container's own stop time-out applies
@@ -2542,23 +2563,34 @@ function shutdownTimeoutFit() {
       }
       $dockerSec += $sec;
     }
+    # 6.12: containers whose own stop time-out has no limit can hold the array stop until the shutdown is forced
+    if ( $unlimited ) {
+      addWarning("<b>Container stop time-out</b> is unlimited",
+        "When the array stops, Unraid waits for each container's own stop time-out. These containers have a negative stop time-out, which means no limit: <b>".htmlspecialchars(implode(", ",$unlimited))."</b>. ".
+        "If one of them does not stop on its own, the shutdown time-out ($shutdown s) runs out and the shutdown is forced, which leads to an unclean shutdown and a parity check. ".
+        "Remove --stop-timeout=-1 from the container's Extra Parameters, or set a number of seconds instead.");
+    }
     $count = count($others);
     if ( $count ) {
-      $sec = min(30,$ownStop(array_keys($others)));
+      # rc.docker kills the daemon after 30 s, so a container without a limit is stopped by then too
+      $before = count($unlimited);
+      $sec = $ownStop(array_keys($others));
+      $sec = count($unlimited) > $before ? 30 : min(30,$sec);
       $parts[] = "$count container".($count > 1 ? "s" : "")." not managed by Unraid, stopped when Docker exits: $sec s";
       $dockerSec += $sec;
     }
     $dockerText = implode(" + ",$parts);
   }
 
-  # VMs: running now, or set to autostart
+  # VMs: running now, paused, or set to autostart (stopped ones too)
   $vmSec = 0;
   $vmText = "";
   if ( is_file("/var/run/libvirt/libvirtd.pid") ) {
     $vms = [];
-    foreach ( ["paused"=>"--state-paused","running"=>"--state-running","autostart"=>"--autostart"] as $state => $option ) {
+    foreach ( ["paused"=>"--state-paused","running"=>"--state-running","autostart"=>"--all --autostart"] as $state => $option ) {
       $out = [];
-      exec("timeout 10 virsh list $option --name 2>/dev/null",$out);
+      exec("timeout 10 virsh list $option --name 2>/dev/null",$out,$rc);
+      if ( $rc ) { $incomplete[] = "libvirt"; }
       foreach ( $out as $vm ) {
         $vm = trim($vm);
         if ( $vm !== "" && ! isset($vms[$vm]) ) { $vms[$vm] = $state; }
@@ -2570,7 +2602,7 @@ function shutdownTimeoutFit() {
       # together, but each stage that has VMs in it can wait up to TIMEOUT: resume paused VMs,
       # hibernate (when VMs are set to hibernate), shut down the rest. Then they are forced off.
       $domainCfg = @my_parse_ini_file("/boot/config/domain.cfg");
-      $vmTimeout = (int)($domainCfg['TIMEOUT'] ?? 0) ?: 60;
+      $vmTimeout = max(0,$setOr($domainCfg['TIMEOUT'] ?? "",60));
       $stages = ["shut down"];
       if ( in_array("paused",$vms) ) { array_unshift($stages,"resume paused"); }
       if ( ($domainCfg['HOSTSHUTDOWN'] ?? "") == "hibernate" ) { array_splice($stages,count($stages)-1,0,["hibernate"]); }
@@ -2589,6 +2621,7 @@ function shutdownTimeoutFit() {
   addWarning("<b>Shutdown time-out</b> may be too short for the containers and VMs",
     "When the server shuts down, Unraid waits at most the shutdown time-out ($shutdown s) for the array to stop, then forces the shutdown, which leads to an unclean shutdown and a parity check. ".
     "Stopping what runs now can take ".implode(" + ",$parts)." + $margin s for unmounting and sync = <b>$needed s</b>. ".
+    ($incomplete ? implode(" and ",array_unique($incomplete))." did not answer in time, so the real time can be longer. " : "").
     "Set the shutdown time-out to at least $recommended s, or lower the time-outs above. Change it here: ".addLinkButton("Disk Settings","/Settings/DiskSettings"));
 }
 ?>
