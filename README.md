@@ -38,7 +38,7 @@ Settings and the ignore list live in `/boot/config/plugins/fix.common.problems/`
 1. Write the check as a function in `include/tests.php`, using `addError()`, `addWarning()` or `addOther()` for its results. Keep the description text the same for the same problem: the ignore list matches on it.
 2. Add the function name to the `$tests` list in `scripts/scan.php`, and a line describing it to `scripts/checkList.php`.
 3. The plugin supports Unraid 6.7.0 and later (`min` in the `.plg`), so code has to run on the PHP versions those releases ship.
-4. Check every changed file with `php -l`.
+4. Check changed PHP files with `php -l` on PHP 7.2 (the version Unraid 6.7.0 ships, for example the `php:7.2-cli` Docker image) and on a current PHP: a newer PHP accepts syntax that 7.2 cannot parse. Check changed Bash scripts with `bash -n`; `php -l` passes any file without PHP tags.
 
 ## Licence
 
